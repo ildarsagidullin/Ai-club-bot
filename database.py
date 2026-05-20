@@ -1,128 +1,85 @@
 """
-База данных: PostgreSQL на Railway, SQLite локально.
-Railway автоматически добавляет DATABASE_URL при подключении PostgreSQL.
+База данных: MongoDB Atlas (постоянное хранение).
+Подключение через MONGO_URL в .env / Railway Variables.
 """
 
 import csv
 import io
 import os
-import sqlite3
+from datetime import datetime, timezone
 
-DATABASE_URL = os.getenv("DATABASE_URL")  # есть на Railway, нет локально
+from pymongo import MongoClient
+
+MONGO_URL = os.getenv("MONGO_URL", "")
+_client = None
+_db = None
 
 # ── Подключение ───────────────────────────────────────────────────────────────
 
-def _get_conn():
-    if DATABASE_URL:
-        import psycopg2
-        return psycopg2.connect(DATABASE_URL)
-    return sqlite3.connect("registrations.db")
+def _get_db():
+    global _client, _db
+    if _db is None:
+        _client = MongoClient(MONGO_URL)
+        _db = _client["aiclub"]
+    return _db
 
-
-def _ph():
-    """Placeholder: %s для PostgreSQL, ? для SQLite."""
-    return "%s" if DATABASE_URL else "?"
-
-
-# ── Инициализация ─────────────────────────────────────────────────────────────
 
 def init_db():
-    conn = _get_conn()
-    cur = conn.cursor()
-    if DATABASE_URL:
-        cur.execute("""
-            CREATE TABLE IF NOT EXISTS registrations (
-                id            SERIAL PRIMARY KEY,
-                telegram_id   BIGINT UNIQUE,
-                username      TEXT,
-                full_name     TEXT,
-                interests     TEXT,
-                registered_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-            )
-        """)
-    else:
-        cur.execute("""
-            CREATE TABLE IF NOT EXISTS registrations (
-                id            INTEGER PRIMARY KEY AUTOINCREMENT,
-                telegram_id   INTEGER UNIQUE,
-                username      TEXT,
-                full_name     TEXT,
-                interests     TEXT,
-                registered_at DATETIME DEFAULT CURRENT_TIMESTAMP
-            )
-        """)
-    conn.commit()
-    cur.close()
-    conn.close()
+    """Создаёт индексы и начальное событие если их нет."""
+    db = _get_db()
+    db["registrations"].create_index("telegram_id", unique=True)
+    # Создаём событие по умолчанию если база пустая
+    if db["events"].count_documents({"_id": "current"}) == 0:
+        db["events"].insert_one({
+            "_id": "current",
+            "topic": "Claude Code — как создавать приложения и сайты без навыков программирования",
+            "date": "16 мая в 14:00",
+            "location": "Stockholm Bistro",
+            "map": "https://maps.app.goo.gl/usmfZse9BjMYhvEJ6",
+            "is_active": True,
+        })
 
 
-# ── Сохранить регистрацию ─────────────────────────────────────────────────────
+# ── Регистрации ───────────────────────────────────────────────────────────────
 
 def save_registration(telegram_id, username, full_name, interests):
-    ph = _ph()
-    conn = _get_conn()
-    cur = conn.cursor()
-    if DATABASE_URL:
-        cur.execute(f"""
-            INSERT INTO registrations (telegram_id, username, full_name, interests)
-            VALUES ({ph}, {ph}, {ph}, {ph})
-            ON CONFLICT (telegram_id) DO UPDATE SET
-                username=EXCLUDED.username,
-                full_name=EXCLUDED.full_name,
-                interests=EXCLUDED.interests,
-                registered_at=CURRENT_TIMESTAMP
-        """, (telegram_id, username, full_name, interests))
-    else:
-        cur.execute(f"""
-            INSERT INTO registrations (telegram_id, username, full_name, interests)
-            VALUES ({ph}, {ph}, {ph}, {ph})
-            ON CONFLICT(telegram_id) DO UPDATE SET
-                username=excluded.username,
-                full_name=excluded.full_name,
-                interests=excluded.interests,
-                registered_at=CURRENT_TIMESTAMP
-        """, (telegram_id, username, full_name, interests))
-    conn.commit()
-    cur.close()
-    conn.close()
+    db = _get_db()
+    db["registrations"].update_one(
+        {"telegram_id": telegram_id},
+        {"$set": {
+            "telegram_id": telegram_id,
+            "username": username,
+            "full_name": full_name,
+            "interests": interests,
+            "registered_at": datetime.now(timezone.utc),
+        }},
+        upsert=True,
+    )
 
-
-# ── Получить всех ─────────────────────────────────────────────────────────────
 
 def get_all_registrations():
-    conn = _get_conn()
-    cur = conn.cursor()
-    cur.execute(
-        "SELECT id, full_name, username, interests, registered_at "
-        "FROM registrations ORDER BY registered_at"
-    )
-    rows = cur.fetchall()
-    cur.close()
-    conn.close()
-    return rows
+    db = _get_db()
+    docs = list(db["registrations"].find({}, {"_id": 0}).sort("registered_at", 1))
+    result = []
+    for i, d in enumerate(docs, 1):
+        result.append((
+            i,
+            d.get("full_name", ""),
+            d.get("username", ""),
+            d.get("interests", ""),
+            str(d.get("registered_at", ""))[:16],
+        ))
+    return result
 
 
 def get_all_telegram_ids():
-    conn = _get_conn()
-    cur = conn.cursor()
-    cur.execute("SELECT telegram_id FROM registrations")
-    ids = [row[0] for row in cur.fetchall()]
-    cur.close()
-    conn.close()
-    return ids
+    db = _get_db()
+    return [d["telegram_id"] for d in db["registrations"].find({}, {"telegram_id": 1})]
 
 
 def get_count():
-    conn = _get_conn()
-    cur = conn.cursor()
-    cur.execute("SELECT COUNT(*) FROM registrations")
-    count = cur.fetchone()[0]
-    cur.close()
-    conn.close()
-    return count
+    return _get_db()["registrations"].count_documents({})
 
-
-# ── Экспорт CSV ───────────────────────────────────────────────────────────────
 
 def export_csv():
     rows = get_all_registrations()
@@ -132,3 +89,42 @@ def export_csv():
     for row in rows:
         writer.writerow(row)
     return output.getvalue().encode("utf-8-sig")
+
+
+# ── Событие (анонс встречи) ───────────────────────────────────────────────────
+
+def get_event() -> dict:
+    """Возвращает текущее событие из БД."""
+    doc = _get_db()["events"].find_one({"_id": "current"})
+    if not doc:
+        return {
+            "topic": "Скоро — следи за анонсами",
+            "date": "—",
+            "location": "—",
+            "map": "",
+            "is_active": False,
+        }
+    return doc
+
+
+def save_event(topic: str, date: str, location: str, map_url: str):
+    """Сохраняет новый анонс встречи."""
+    _get_db()["events"].update_one(
+        {"_id": "current"},
+        {"$set": {
+            "topic": topic,
+            "date": date,
+            "location": location,
+            "map": map_url,
+            "is_active": True,
+        }},
+        upsert=True,
+    )
+
+
+def set_event_active(is_active: bool):
+    """Включает / выключает отображение анонса."""
+    _get_db()["events"].update_one(
+        {"_id": "current"},
+        {"$set": {"is_active": is_active}},
+    )

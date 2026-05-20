@@ -25,11 +25,25 @@ logging.basicConfig(
     level=logging.INFO,
 )
 
-# ── Состояния диалога ─────────────────────────────────────────────────────────
-MAIN_MENU, ASK_NAME, POLL, ADMIN_AUTH, BROADCAST = range(5)
+# ── Состояния ─────────────────────────────────────────────────────────────────
+(
+    MAIN_MENU,
+    ASK_NAME,
+    POLL,
+    ADMIN_AUTH,
+    BROADCAST,
+    EVENT_MENU,
+    EVENT_TOPIC,
+    EVENT_DATE,
+    EVENT_LOCATION,
+    EVENT_MAP,
+) = range(10)
 
 
-# ── /start ────────────────────────────────────────────────────────────────────
+# ═══════════════════════════════════════════════════════════════════════════════
+# ГЛАВНОЕ МЕНЮ
+# ═══════════════════════════════════════════════════════════════════════════════
+
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     context.user_data.clear()
     keyboard = [
@@ -45,14 +59,22 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     return MAIN_MENU
 
 
-# ── Главное меню (callback) ───────────────────────────────────────────────────
 async def menu_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     query = update.callback_query
     await query.answer()
 
     if query.data == "register":
+        event = db.get_event()
+        if not event.get("is_active", True):
+            await query.edit_message_text(
+                msg.EVENT_INACTIVE,
+                parse_mode="MarkdownV2",
+                disable_web_page_preview=False,
+            )
+            return ConversationHandler.END
+
         await query.edit_message_text(
-            msg.EVENT_CARD,
+            msg.build_event_card(),
             parse_mode="MarkdownV2",
             disable_web_page_preview=False,
         )
@@ -79,7 +101,10 @@ async def menu_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> i
     return MAIN_MENU
 
 
-# ── Шаг 1: получаем имя → сразу показываем опрос ─────────────────────────────
+# ═══════════════════════════════════════════════════════════════════════════════
+# РЕГИСТРАЦИЯ
+# ═══════════════════════════════════════════════════════════════════════════════
+
 async def receive_name(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     name = update.message.text.strip()
     if len(name) < 2:
@@ -104,7 +129,6 @@ def _build_poll_keyboard(selected: set) -> list:
     return rows
 
 
-# ── Опрос (multi-select) ──────────────────────────────────────────────────────
 async def poll_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     query = update.callback_query
 
@@ -120,7 +144,7 @@ async def poll_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> i
         return ConversationHandler.END
 
     await query.answer()
-    key = query.data[5:]  # strip "poll_"
+    key = query.data[5:]
     interests: set = context.user_data.setdefault("interests", set())
     if key in interests:
         interests.discard(key)
@@ -132,7 +156,6 @@ async def poll_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> i
     return POLL
 
 
-# ── Завершение регистрации ────────────────────────────────────────────────────
 async def _finish_registration(query, context: ContextTypes.DEFAULT_TYPE, interests_str: str):
     try:
         name     = context.user_data["name"]
@@ -143,13 +166,9 @@ async def _finish_registration(query, context: ContextTypes.DEFAULT_TYPE, intere
         db.save_registration(tg_id, username, name, interests_str)
         count = db.get_count()
 
-        confirmation = msg.CONFIRMATION_TPL.format(
-            name=msg.esc(name),
-            community=COMMUNITY_LINK,
-        )
         await context.bot.send_message(
             chat_id=query.message.chat_id,
-            text=confirmation,
+            text=msg.build_confirmation(name),
             parse_mode="MarkdownV2",
             disable_web_page_preview=False,
         )
@@ -170,7 +189,7 @@ async def _finish_registration(query, context: ContextTypes.DEFAULT_TYPE, intere
             logging.warning("Не удалось уведомить администратора: %s", exc)
 
     except Exception as exc:
-        logging.error("Ошибка при завершении регистрации: %s", exc, exc_info=True)
+        logging.error("Ошибка при регистрации: %s", exc, exc_info=True)
         try:
             await context.bot.send_message(
                 chat_id=query.message.chat_id,
@@ -180,7 +199,10 @@ async def _finish_registration(query, context: ContextTypes.DEFAULT_TYPE, intere
             pass
 
 
-# ── /admin ────────────────────────────────────────────────────────────────────
+# ═══════════════════════════════════════════════════════════════════════════════
+# /admin — список участников
+# ═══════════════════════════════════════════════════════════════════════════════
+
 async def admin_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     await update.message.reply_text(msg.ADMIN_ASK_PASSWORD)
     return ADMIN_AUTH
@@ -207,14 +229,17 @@ async def admin_auth(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     return ConversationHandler.END
 
 
-# ── /broadcast ───────────────────────────────────────────────────────────────
+# ═══════════════════════════════════════════════════════════════════════════════
+# /broadcast — рассылка всем
+# ═══════════════════════════════════════════════════════════════════════════════
+
 async def broadcast_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     if update.effective_user.id != ADMIN_ID:
         return ConversationHandler.END
     count = db.get_count()
     await update.message.reply_text(
         f"📢 Напиши текст сообщения — разошлю всем {count} зарегистрированным.\n\n"
-        "Можно использовать эмодзи. Отправь /cancel чтобы отменить."
+        "Отправь /cancel чтобы отменить."
     )
     return BROADCAST
 
@@ -229,9 +254,7 @@ async def broadcast_send(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
             sent += 1
         except Exception:
             failed += 1
-    await update.message.reply_text(
-        f"✅ Готово! Отправлено: {sent}, не доставлено: {failed}"
-    )
+    await update.message.reply_text(f"✅ Готово! Отправлено: {sent}, не доставлено: {failed}")
     return ConversationHandler.END
 
 
@@ -240,7 +263,129 @@ async def broadcast_cancel(update: Update, context: ContextTypes.DEFAULT_TYPE) -
     return ConversationHandler.END
 
 
-# ── /export ───────────────────────────────────────────────────────────────────
+# ═══════════════════════════════════════════════════════════════════════════════
+# /event — управление анонсом (только для админа)
+# ═══════════════════════════════════════════════════════════════════════════════
+
+async def event_menu(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    if update.effective_user.id != ADMIN_ID:
+        return ConversationHandler.END
+    event = db.get_event()
+    toggle_btn = (
+        InlineKeyboardButton(msg.BTN_ACTIVATE,    callback_data="ev_activate")
+        if not event.get("is_active")
+        else InlineKeyboardButton(msg.BTN_DEACTIVATE, callback_data="ev_deactivate")
+    )
+    keyboard = [
+        [InlineKeyboardButton(msg.BTN_EDIT_EVENT, callback_data="ev_edit")],
+        [toggle_btn],
+        [InlineKeyboardButton(msg.BTN_CANCEL_EVENT, callback_data="ev_cancel")],
+    ]
+    await update.message.reply_text(
+        msg.build_event_admin_menu(),
+        parse_mode="MarkdownV2",
+        reply_markup=InlineKeyboardMarkup(keyboard),
+    )
+    return EVENT_MENU
+
+
+async def event_menu_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    query = update.callback_query
+    await query.answer()
+
+    if query.data == "ev_edit":
+        await query.edit_message_text(msg.ASK_EVENT_TOPIC, parse_mode="MarkdownV2")
+        return EVENT_TOPIC
+
+    if query.data == "ev_deactivate":
+        db.set_event_active(False)
+        await query.edit_message_text(msg.EVENT_HIDDEN, parse_mode="MarkdownV2")
+        return ConversationHandler.END
+
+    if query.data == "ev_activate":
+        db.set_event_active(True)
+        await query.edit_message_text(msg.EVENT_SHOWN, parse_mode="MarkdownV2")
+        return ConversationHandler.END
+
+    if query.data == "ev_cancel":
+        await query.edit_message_text(msg.EVENT_CANCELLED, parse_mode="MarkdownV2")
+        return ConversationHandler.END
+
+    return EVENT_MENU
+
+
+async def event_receive_topic(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    context.user_data["new_topic"] = update.message.text.strip()
+    await update.message.reply_text(msg.ASK_EVENT_DATE, parse_mode="MarkdownV2")
+    return EVENT_DATE
+
+
+async def event_receive_date(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    context.user_data["new_date"] = update.message.text.strip()
+    await update.message.reply_text(msg.ASK_EVENT_LOCATION, parse_mode="MarkdownV2")
+    return EVENT_LOCATION
+
+
+async def event_receive_location(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    context.user_data["new_location"] = update.message.text.strip()
+    await update.message.reply_text(msg.ASK_EVENT_MAP, parse_mode="MarkdownV2")
+    return EVENT_MAP
+
+
+async def event_receive_map(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    raw = update.message.text.strip()
+    map_url = "" if raw.lower() in ("нет", "no", "-", "—") else raw
+
+    topic    = context.user_data["new_topic"]
+    date     = context.user_data["new_date"]
+    location = context.user_data["new_location"]
+
+    # Показываем превью
+    preview = (
+        "👀 *Вот как будет выглядеть анонс:*\n\n"
+        f"📌 *Тема:* {msg.esc(topic)}\n"
+        f"🕐 *Когда:* {msg.esc(date)}\n"
+        f"📍 *Где:* {msg.esc(location)}\n"
+    )
+    if map_url:
+        preview += f"🗺 [Карта]({map_url})\n"
+
+    keyboard = [
+        [InlineKeyboardButton("✅ Сохранить", callback_data="ev_save")],
+        [InlineKeyboardButton("↩️ Отмена",   callback_data="ev_cancel")],
+    ]
+    context.user_data["new_map"] = map_url
+    await update.message.reply_text(
+        preview,
+        parse_mode="MarkdownV2",
+        reply_markup=InlineKeyboardMarkup(keyboard),
+        disable_web_page_preview=True,
+    )
+    return EVENT_MAP
+
+
+async def event_save_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    query = update.callback_query
+    await query.answer()
+
+    if query.data == "ev_save":
+        db.save_event(
+            topic=context.user_data["new_topic"],
+            date=context.user_data["new_date"],
+            location=context.user_data["new_location"],
+            map_url=context.user_data["new_map"],
+        )
+        await query.edit_message_text(msg.EVENT_SAVED, parse_mode="MarkdownV2")
+    else:
+        await query.edit_message_text(msg.EVENT_CANCELLED, parse_mode="MarkdownV2")
+
+    return ConversationHandler.END
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# /export
+# ═══════════════════════════════════════════════════════════════════════════════
+
 async def export_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.effective_user.id != ADMIN_ID:
         return
@@ -258,24 +403,21 @@ async def fallback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     return ConversationHandler.END
 
 
-# ── Запуск ────────────────────────────────────────────────────────────────────
+# ═══════════════════════════════════════════════════════════════════════════════
+# ЗАПУСК
+# ═══════════════════════════════════════════════════════════════════════════════
+
 def main():
     db.init_db()
-
     app = Application.builder().token(BOT_TOKEN).build()
 
+    # Главная воронка регистрации
     main_conv = ConversationHandler(
         entry_points=[CommandHandler("start", start)],
         states={
-            MAIN_MENU: [
-                CallbackQueryHandler(menu_callback, pattern="^(register|about|contact)$")
-            ],
-            ASK_NAME: [
-                MessageHandler(filters.TEXT & ~filters.COMMAND, receive_name)
-            ],
-            POLL: [
-                CallbackQueryHandler(poll_callback, pattern="^poll_")
-            ],
+            MAIN_MENU: [CallbackQueryHandler(menu_callback, pattern="^(register|about|contact)$")],
+            ASK_NAME:  [MessageHandler(filters.TEXT & ~filters.COMMAND, receive_name)],
+            POLL:      [CallbackQueryHandler(poll_callback, pattern="^poll_")],
         },
         fallbacks=[
             CommandHandler("start", start),
@@ -284,29 +426,44 @@ def main():
         allow_reentry=True,
     )
 
+    # Список участников
     admin_conv = ConversationHandler(
         entry_points=[CommandHandler("admin", admin_start)],
         states={
-            ADMIN_AUTH: [
-                MessageHandler(filters.TEXT & ~filters.COMMAND, admin_auth)
+            ADMIN_AUTH: [MessageHandler(filters.TEXT & ~filters.COMMAND, admin_auth)],
+        },
+        fallbacks=[CommandHandler("start", start)],
+    )
+
+    # Рассылка
+    broadcast_conv = ConversationHandler(
+        entry_points=[CommandHandler("broadcast", broadcast_start)],
+        states={
+            BROADCAST: [MessageHandler(filters.TEXT & ~filters.COMMAND, broadcast_send)],
+        },
+        fallbacks=[CommandHandler("cancel", broadcast_cancel)],
+    )
+
+    # Управление анонсом
+    event_conv = ConversationHandler(
+        entry_points=[CommandHandler("event", event_menu)],
+        states={
+            EVENT_MENU:     [CallbackQueryHandler(event_menu_callback, pattern="^ev_")],
+            EVENT_TOPIC:    [MessageHandler(filters.TEXT & ~filters.COMMAND, event_receive_topic)],
+            EVENT_DATE:     [MessageHandler(filters.TEXT & ~filters.COMMAND, event_receive_date)],
+            EVENT_LOCATION: [MessageHandler(filters.TEXT & ~filters.COMMAND, event_receive_location)],
+            EVENT_MAP:      [
+                MessageHandler(filters.TEXT & ~filters.COMMAND, event_receive_map),
+                CallbackQueryHandler(event_save_callback, pattern="^ev_(save|cancel)$"),
             ],
         },
         fallbacks=[CommandHandler("start", start)],
     )
 
-    broadcast_conv = ConversationHandler(
-        entry_points=[CommandHandler("broadcast", broadcast_start)],
-        states={
-            BROADCAST: [
-                MessageHandler(filters.TEXT & ~filters.COMMAND, broadcast_send),
-            ],
-        },
-        fallbacks=[CommandHandler("cancel", broadcast_cancel)],
-    )
-
     app.add_handler(main_conv)
     app.add_handler(admin_conv)
     app.add_handler(broadcast_conv)
+    app.add_handler(event_conv)
     app.add_handler(CommandHandler("export", export_command))
 
     print("✅ Бот запущен. Нажми Ctrl+C чтобы остановить.")
