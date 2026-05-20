@@ -1,89 +1,171 @@
 """
-База данных: MongoDB Atlas (постоянное хранение).
-Подключение через MONGO_URL в .env / Railway Variables.
+База данных: PostgreSQL (Railway) или SQLite (локально).
+Railway автоматически даёт DATABASE_URL при подключении PostgreSQL.
 """
 
 import csv
 import io
 import os
-from datetime import datetime, timezone
+import sqlite3
+from datetime import datetime
 
-from pymongo import MongoClient
+DATABASE_URL = os.getenv("DATABASE_URL")
 
-MONGO_URL = os.getenv("MONGO_URL", "")
-_client = None
-_db = None
+_pg_conn = None
 
-# ── Подключение ───────────────────────────────────────────────────────────────
 
-def _get_db():
-    global _client, _db
-    if _db is None:
-        _client = MongoClient(
-            MONGO_URL,
-            tls=True,
-            tlsAllowInvalidCertificates=True,
-            serverSelectionTimeoutMS=10000,
-        )
-        _db = _client["aiclub"]
-    return _db
+def _get_conn():
+    global _pg_conn
+    if DATABASE_URL:
+        import psycopg2
+        # Переиспользуем соединение если оно живое
+        try:
+            if _pg_conn and not _pg_conn.closed:
+                _pg_conn.cursor().execute("SELECT 1")
+                return _pg_conn
+        except Exception:
+            pass
+        _pg_conn = psycopg2.connect(DATABASE_URL, sslmode="require")
+        return _pg_conn
+    return sqlite3.connect("registrations.db")
+
+
+def _ph():
+    return "%s" if DATABASE_URL else "?"
 
 
 def init_db():
-    """Создаёт индексы и начальное событие если их нет."""
-    db = _get_db()
-    db["registrations"].create_index("telegram_id", unique=True)
-    # Создаём событие по умолчанию если база пустая
-    if db["events"].count_documents({"_id": "current"}) == 0:
-        db["events"].insert_one({
-            "_id": "current",
-            "topic": "Claude Code — как создавать приложения и сайты без навыков программирования",
-            "date": "16 мая в 14:00",
-            "location": "Stockholm Bistro",
-            "map": "https://maps.app.goo.gl/usmfZse9BjMYhvEJ6",
-            "is_active": True,
-        })
+    conn = _get_conn()
+    cur = conn.cursor()
+    if DATABASE_URL:
+        cur.execute("""
+            CREATE TABLE IF NOT EXISTS registrations (
+                id            SERIAL PRIMARY KEY,
+                telegram_id   BIGINT UNIQUE,
+                username      TEXT,
+                full_name     TEXT,
+                interests     TEXT,
+                registered_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            )
+        """)
+        cur.execute("""
+            CREATE TABLE IF NOT EXISTS events (
+                key        TEXT PRIMARY KEY,
+                topic      TEXT,
+                date       TEXT,
+                location   TEXT,
+                map        TEXT,
+                is_active  BOOLEAN DEFAULT TRUE
+            )
+        """)
+        # Дефолтное событие
+        cur.execute("""
+            INSERT INTO events (key, topic, date, location, map, is_active)
+            VALUES (%s, %s, %s, %s, %s, %s)
+            ON CONFLICT (key) DO NOTHING
+        """, (
+            "current",
+            "Claude Code — как создавать приложения и сайты без навыков программирования",
+            "16 мая в 14:00",
+            "Stockholm Bistro",
+            "https://maps.app.goo.gl/usmfZse9BjMYhvEJ6",
+            True,
+        ))
+    else:
+        cur.execute("""
+            CREATE TABLE IF NOT EXISTS registrations (
+                id            INTEGER PRIMARY KEY AUTOINCREMENT,
+                telegram_id   INTEGER UNIQUE,
+                username      TEXT,
+                full_name     TEXT,
+                interests     TEXT,
+                registered_at DATETIME DEFAULT CURRENT_TIMESTAMP
+            )
+        """)
+        cur.execute("""
+            CREATE TABLE IF NOT EXISTS events (
+                key        TEXT PRIMARY KEY,
+                topic      TEXT,
+                date       TEXT,
+                location   TEXT,
+                map        TEXT,
+                is_active  INTEGER DEFAULT 1
+            )
+        """)
+        cur.execute("""
+            INSERT OR IGNORE INTO events (key, topic, date, location, map, is_active)
+            VALUES (?, ?, ?, ?, ?, ?)
+        """, (
+            "current",
+            "Claude Code — как создавать приложения и сайты без навыков программирования",
+            "16 мая в 14:00",
+            "Stockholm Bistro",
+            "https://maps.app.goo.gl/usmfZse9BjMYhvEJ6",
+            1,
+        ))
+    conn.commit()
+    cur.close() if DATABASE_URL else None
 
-
-# ── Регистрации ───────────────────────────────────────────────────────────────
 
 def save_registration(telegram_id, username, full_name, interests):
-    db = _get_db()
-    db["registrations"].update_one(
-        {"telegram_id": telegram_id},
-        {"$set": {
-            "telegram_id": telegram_id,
-            "username": username,
-            "full_name": full_name,
-            "interests": interests,
-            "registered_at": datetime.now(timezone.utc),
-        }},
-        upsert=True,
-    )
+    ph = _ph()
+    conn = _get_conn()
+    cur = conn.cursor()
+    if DATABASE_URL:
+        cur.execute(f"""
+            INSERT INTO registrations (telegram_id, username, full_name, interests)
+            VALUES ({ph}, {ph}, {ph}, {ph})
+            ON CONFLICT (telegram_id) DO UPDATE SET
+                username=EXCLUDED.username,
+                full_name=EXCLUDED.full_name,
+                interests=EXCLUDED.interests,
+                registered_at=CURRENT_TIMESTAMP
+        """, (telegram_id, username, full_name, interests))
+    else:
+        cur.execute(f"""
+            INSERT INTO registrations (telegram_id, username, full_name, interests)
+            VALUES ({ph}, {ph}, {ph}, {ph})
+            ON CONFLICT(telegram_id) DO UPDATE SET
+                username=excluded.username,
+                full_name=excluded.full_name,
+                interests=excluded.interests,
+                registered_at=CURRENT_TIMESTAMP
+        """, (telegram_id, username, full_name, interests))
+    conn.commit()
+    cur.close() if DATABASE_URL else None
 
 
 def get_all_registrations():
-    db = _get_db()
-    docs = list(db["registrations"].find({}, {"_id": 0}).sort("registered_at", 1))
+    conn = _get_conn()
+    cur = conn.cursor()
+    cur.execute(
+        "SELECT id, full_name, username, interests, registered_at "
+        "FROM registrations ORDER BY registered_at"
+    )
+    rows = cur.fetchall()
+    cur.close() if DATABASE_URL else None
     result = []
-    for i, d in enumerate(docs, 1):
-        result.append((
-            i,
-            d.get("full_name", ""),
-            d.get("username", ""),
-            d.get("interests", ""),
-            str(d.get("registered_at", ""))[:16],
-        ))
+    for row in rows:
+        result.append((row[0], row[1], row[2], row[3], str(row[4])[:16]))
     return result
 
 
 def get_all_telegram_ids():
-    db = _get_db()
-    return [d["telegram_id"] for d in db["registrations"].find({}, {"telegram_id": 1})]
+    conn = _get_conn()
+    cur = conn.cursor()
+    cur.execute("SELECT telegram_id FROM registrations")
+    ids = [row[0] for row in cur.fetchall()]
+    cur.close() if DATABASE_URL else None
+    return ids
 
 
 def get_count():
-    return _get_db()["registrations"].count_documents({})
+    conn = _get_conn()
+    cur = conn.cursor()
+    cur.execute("SELECT COUNT(*) FROM registrations")
+    count = cur.fetchone()[0]
+    cur.close() if DATABASE_URL else None
+    return count
 
 
 def export_csv():
@@ -96,40 +178,58 @@ def export_csv():
     return output.getvalue().encode("utf-8-sig")
 
 
-# ── Событие (анонс встречи) ───────────────────────────────────────────────────
+# ── Событие ───────────────────────────────────────────────────────────────────
 
 def get_event() -> dict:
-    """Возвращает текущее событие из БД."""
-    doc = _get_db()["events"].find_one({"_id": "current"})
-    if not doc:
-        return {
-            "topic": "Скоро — следи за анонсами",
-            "date": "—",
-            "location": "—",
-            "map": "",
-            "is_active": False,
-        }
-    return doc
+    conn = _get_conn()
+    cur = conn.cursor()
+    cur.execute("SELECT topic, date, location, map, is_active FROM events WHERE key=%s" if DATABASE_URL
+                else "SELECT topic, date, location, map, is_active FROM events WHERE key=?",
+                ("current",))
+    row = cur.fetchone()
+    cur.close() if DATABASE_URL else None
+    if not row:
+        return {"topic": "Скоро", "date": "—", "location": "—", "map": "", "is_active": False}
+    return {
+        "topic":     row[0],
+        "date":      row[1],
+        "location":  row[2],
+        "map":       row[3] or "",
+        "is_active": bool(row[4]),
+    }
 
 
 def save_event(topic: str, date: str, location: str, map_url: str):
-    """Сохраняет новый анонс встречи."""
-    _get_db()["events"].update_one(
-        {"_id": "current"},
-        {"$set": {
-            "topic": topic,
-            "date": date,
-            "location": location,
-            "map": map_url,
-            "is_active": True,
-        }},
-        upsert=True,
-    )
+    ph = _ph()
+    conn = _get_conn()
+    cur = conn.cursor()
+    if DATABASE_URL:
+        cur.execute("""
+            INSERT INTO events (key, topic, date, location, map, is_active)
+            VALUES (%s, %s, %s, %s, %s, TRUE)
+            ON CONFLICT (key) DO UPDATE SET
+                topic=EXCLUDED.topic, date=EXCLUDED.date,
+                location=EXCLUDED.location, map=EXCLUDED.map, is_active=TRUE
+        """, ("current", topic, date, location, map_url))
+    else:
+        cur.execute("""
+            INSERT INTO events (key, topic, date, location, map, is_active)
+            VALUES (?, ?, ?, ?, ?, 1)
+            ON CONFLICT(key) DO UPDATE SET
+                topic=excluded.topic, date=excluded.date,
+                location=excluded.location, map=excluded.map, is_active=1
+        """, ("current", topic, date, location, map_url))
+    conn.commit()
+    cur.close() if DATABASE_URL else None
 
 
 def set_event_active(is_active: bool):
-    """Включает / выключает отображение анонса."""
-    _get_db()["events"].update_one(
-        {"_id": "current"},
-        {"$set": {"is_active": is_active}},
+    ph = _ph()
+    conn = _get_conn()
+    cur = conn.cursor()
+    cur.execute(
+        f"UPDATE events SET is_active={ph} WHERE key={ph}",
+        (is_active, "current")
     )
+    conn.commit()
+    cur.close() if DATABASE_URL else None
