@@ -1,0 +1,24 @@
+services:
+  - type: worker
+    name: ai-club-bot
+    runtime: python
+    buildCommand: pip install -r requirements.txt
+    startCommand: python bot.py
+    envVars:
+      - key: BOT_TOKEN
+        sync: false
+      - key: ADMIN_ID
+        sync: false
+      - key: ADMIN_PASSWORD
+        sync: false
+      - key: COMMUNITY_LINK
+        sync: false
+      - key: DATABASE_URL
+        fromDatabase:
+          name: ai-club-db
+          property: connectionString
+
+databases:
+  - name: ai-club-db
+    databaseName: aiclub
+    plan: free
