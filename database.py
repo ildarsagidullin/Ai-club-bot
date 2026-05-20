@@ -19,7 +19,12 @@ _db = None
 def _get_db():
     global _client, _db
     if _db is None:
-        _client = MongoClient(MONGO_URL)
+        _client = MongoClient(
+            MONGO_URL,
+            tls=True,
+            tlsAllowInvalidCertificates=True,
+            serverSelectionTimeoutMS=10000,
+        )
         _db = _client["aiclub"]
     return _db
 
